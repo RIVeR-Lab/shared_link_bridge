@@ -4,14 +4,17 @@ project(shared_link_bridge)
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(std_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/GpsValues.msg"
   "msg/KairosValues.msg"
   "msg/VehicleControl.msg"
   "srv/GetVehicleControl.srv"
   "srv/SetEStopState.srv"
   "srv/ExecCmd.srv"
   "srv/FieldUpdate.srv"
+  DEPENDENCIES std_msgs
 )
 
 # already called somewhere caused duplicate error

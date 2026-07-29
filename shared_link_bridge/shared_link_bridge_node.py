@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, fields
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-from shared_link_bridge.msg import KairosValues, VehicleControl
+from shared_link_bridge.msg import GpsValues, KairosValues, VehicleControl
 from shared_link_bridge.srv import GetVehicleControl, ExecCmd, FieldUpdate
 
 from UDPConnection import UdpConnection
@@ -106,6 +106,16 @@ INBOUND_TO_ROS = {
     'Health_total':      'health_total',
 }
 
+GPS_FIELDS = {
+    'AutoGpsHead':       'auto_gps_head',
+    'AutoGpsLat':        'auto_gps_lat',
+    'AutoGpsLon':        'auto_gps_lon',
+    'AutoGpsVel':        'auto_gps_vel',
+    'AutoGpsReferences': 'auto_gps_references',
+    'AutoGpsQuality':    'auto_gps_quality',
+    'AutoGpsStamp':      'auto_gps_stamp',
+}
+
 class SharedLinkNode(Node):
     def __init__(self):
         super().__init__('shared_link_bridge_node')
@@ -114,6 +124,8 @@ class SharedLinkNode(Node):
         self._outbound = SharedLinkOutbound()
         self._inbound = SharedLinkInbound()
         self._udp = UdpConnection(KAIROS_IP, KAIROS_PORT, LOCAL_PORT, self._msg_parser)
+
+        self._gps_pub = self.create_publisher(GpsValues, 'gps_values', 10)
 
         self._kairos_pub = self.create_publisher(KairosValues, 'kairos_values', 10)
 
@@ -159,6 +171,15 @@ class SharedLinkNode(Node):
             ros_field = INBOUND_TO_ROS.get(f.name, f.name) # Swaps for ROS name, or leaves as is if not on list
             setattr(ros_msg, ros_field, sv.value)
         self._kairos_pub.publish(ros_msg)
+
+    def _publish_gps_values(self):
+        ros_msg = GpsValues()
+        ros_msg.header.stamp = self.get_clock().now().to_msg()
+        for inbound_name, ros_name in GPS_FIELDS.items():
+            sv: SVField = getattr(self._inbound, inbound_name)
+            if sv.value is not None:
+                setattr(ros_msg, ros_name, sv.value)
+        self._gps_pub.publish(ros_msg)
 
     ### SUBSCRIBERS
     def _vehicle_control_callback(self, msg: VehicleControl):
@@ -297,6 +318,7 @@ class SharedLinkNode(Node):
             sv: SVField = getattr(self._inbound, f.name)
             sv.apply(d_fields[i][1:])  # strip leading 'D'
         self._publish_kairos_values()
+        self._publish_gps_values()
 
     ### SEND MSG + HELPERS
     def sendMsg(self, msg: str) -> None:
