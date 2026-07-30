@@ -5,6 +5,7 @@ from enum import Enum
 from dataclasses import dataclass, field, fields
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import String
 from shared_link_bridge.msg import GpsValues, KairosValues, VehicleControl
@@ -349,9 +350,17 @@ class SharedLinkNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    rclpy.spin(SharedLinkNode())
-    rclpy.shutdown()
+    node = SharedLinkNode()
+
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

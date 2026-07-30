@@ -3,6 +3,7 @@
 from enum import Enum
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 
 from shared_link_bridge.srv import SetEStopState
@@ -84,8 +85,16 @@ class EStopBeaconNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    rclpy.spin(EStopBeaconNode())
-    rclpy.shutdown()
+    node = EStopBeaconNode()
+
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
