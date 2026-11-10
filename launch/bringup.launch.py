@@ -27,6 +27,6 @@ def generate_launch_description():
             executable='controller_teleop.py',
             name='controller_teleop',
             output='screen',
-            prefix='xterm -e',   # see note below
+            prefix='xterm -hold -e',   # see note below
         ),
     ])
