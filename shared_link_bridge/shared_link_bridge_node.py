@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import time
 from typing import Union
 
 from enum import Enum
@@ -13,6 +14,13 @@ from shared_link_bridge.srv import GetVehicleControl, ExecCmd, FieldUpdate
 
 from UDPConnection import UdpConnection
 from premade_msgs import *
+
+# Command ranges from the SharedLink Teleop Only ICD (BUL-110, v1.00.15).
+# Every outbound value is clamped to these before it goes on the wire.
+JOY_STEER_MAX = 450.0    # steering-wheel degrees, +-450
+VEH_BRAKE_MAX = 100      # 0-100 %
+VEH_THROTTLE_MAX = 1000  # 0-1000 = 0-100.0 %
+VEH_SHIFT_MAX = 3        # 0 Park, 1 Reverse, 2 Neutral, 3 Drive
 
 
 class TYPE(Enum):
@@ -121,7 +129,29 @@ class SharedLinkNode(Node):
     def __init__(self):
         super().__init__('shared_link_bridge_node')
         self.declare_parameter('update_rate', 0.05)
+        # ROS side (/vehicle_control, /kairos_values) uses REP 103: positive steering = left.
+        # Kairos uses positive = right (ICD example stream: "Steer Left" sends joy_steer -359).
+        self.declare_parameter('invert_steering', True)
+        # Hard limits applied on the wire. Teleop's own scales live in controller_teleop.yaml.
+        self.declare_parameter('steer_limit', JOY_STEER_MAX)        # float, <= 450.0
+        self.declare_parameter('throttle_limit', VEH_THROTTLE_MAX)  # int, <= 1000
+        # Seconds without a /vehicle_control message, while motion is enabled, before the
+        # bridge disables motion on its own. 0.0 turns the watchdog off.
+        self.declare_parameter('command_timeout', 0.5)
+        self.declare_parameter('timeout_brake', VEH_BRAKE_MAX)      # brake applied on timeout
+
         self._update_rate = self.get_parameter('update_rate').value
+        self._invert_steering = bool(self.get_parameter('invert_steering').value)
+        self._steer_limit = min(abs(float(self.get_parameter('steer_limit').value)), JOY_STEER_MAX)
+        self._throttle_limit = max(0, min(int(self.get_parameter('throttle_limit').value),
+                                          VEH_THROTTLE_MAX))
+        self._command_timeout = float(self.get_parameter('command_timeout').value)
+        self._timeout_brake = max(0, min(int(self.get_parameter('timeout_brake').value),
+                                         VEH_BRAKE_MAX))
+        self._last_cmd_time = None   # monotonic time of the last /vehicle_control message
+        self._timed_out = False
+        self._disconnected = False
+        self._closed = False
         self._outbound = SharedLinkOutbound()
         self._inbound = SharedLinkInbound()
         self._udp = UdpConnection(KAIROS_IP, KAIROS_PORT, LOCAL_PORT, self._msg_parser)
@@ -155,9 +185,19 @@ class SharedLinkNode(Node):
 
         self.get_logger().info("shared_link_bridge_node successfully initialized")
 
+    def shutdown(self):
+        """End the SharedLink session and stop the UDP link. Safe to call more than once."""
+        if getattr(self, '_closed', True):
+            return
+        self._closed = True
+        try:
+            if not self._disconnected:
+                self._disconnect()
+        finally:
+            self._udp.stop()
+
     def __del__(self):
-        self._disconnect()
-        self._udp.stop()
+        self.shutdown()
 
     # -------------- #
     #      ROS
@@ -170,7 +210,7 @@ class SharedLinkNode(Node):
             if sv.value is None:
                 continue
             ros_field = INBOUND_TO_ROS.get(f.name, f.name) # Swaps for ROS name, or leaves as is if not on list
-            setattr(ros_msg, ros_field, sv.value)
+            setattr(ros_msg, ros_field, self._ros_inbound_value(f.name, sv.value))
         self._kairos_pub.publish(ros_msg)
 
     def _publish_gps_values(self):
@@ -184,6 +224,10 @@ class SharedLinkNode(Node):
 
     ### SUBSCRIBERS
     def _vehicle_control_callback(self, msg: VehicleControl):
+        self._last_cmd_time = time.monotonic()
+        if self._timed_out:
+            self._timed_out = False
+            self.get_logger().info('/vehicle_control resumed')
         for f in fields(self._outbound):
             sv: SVField = getattr(self._outbound, f.name)
             sv.apply(str(getattr(msg, f.name)))
@@ -228,6 +272,7 @@ class SharedLinkNode(Node):
 
     ### TIMER
     def _timer_callback(self):
+        self._check_command_timeout()
         self._inbound_count += 1
         if self._inbound_count < int(1.0 / self._update_rate):
             self.send_data()
@@ -272,18 +317,19 @@ class SharedLinkNode(Node):
                 case "G0":
                     print("Received Pong Message (ping ACK)")
                 case _:
-                    print(f"Received {split_data[1]} msg")
+                    print(f"Received {split_data[1]} msg: {data}")
 
     ### SEND
 
     # Confirm functionality with 
     # tcpdump -i wlp3s0 -n 'udp port 4000'
     def send_data(self, delta_only: bool = True):
-        msg = 'N0|'
+        # ICD layout: [:BA|N0|D<v>|D<v>|...|D|C<xx>]. No empty field after N0.
+        msg = 'N0'
         for f in fields(self._outbound):
             sv: SVField = getattr(self._outbound, f.name)
             if not delta_only or sv.updated:
-                msg += f'|D{sv.value}'
+                msg += f'|D{self._wire_value(f.name, sv.value)}'
                 sv.updated = False
             else:
                 msg += '|D'
@@ -294,6 +340,7 @@ class SharedLinkNode(Node):
     # -------------- #
     ### COMMANDS
     def _connect(self):
+        self._disconnected = False
         self.sendMsg(declare_myIP_msg)
         self.sendMsgs(enab_msgs)
         self.sendMsgs(list_SVs_msgs)
@@ -302,6 +349,7 @@ class SharedLinkNode(Node):
     def _disconnect(self):
         self._teleop_stop()
         self.sendMsgs(term_msgs)
+        self._disconnected = True
         self.get_logger().info("Disconnect Messages Sent")
 
     def _teleop_start(self):
@@ -312,6 +360,42 @@ class SharedLinkNode(Node):
         self.sendMsg(teleop_stop)
         self.get_logger().info("Teleop STOP Messages Sent")
 
+
+    def _wire_value(self, name: str, value):
+        """Convert one outbound value from the ROS convention to Kairos's, clamped to the ICD range."""
+        if name == 'joy_steer':
+            v = -float(value) if self._invert_steering else float(value)
+            v = max(-self._steer_limit, min(self._steer_limit, v))
+            return v if v != 0 else 0.0   # never send '-0.0'
+        if name == 'veh_throttle':
+            return max(0, min(int(value), self._throttle_limit))
+        if name == 'veh_brake':
+            return max(0, min(int(value), VEH_BRAKE_MAX))
+        if name == 'veh_shift':
+            return max(0, min(int(value), VEH_SHIFT_MAX))
+        return value
+
+    def _ros_inbound_value(self, name: str, value):
+        """Convert one inbound value from Kairos's convention to the ROS one."""
+        if name == 'steerang' and self._invert_steering and isinstance(value, (int, float)):
+            return -value if value != 0 else value
+        return value
+
+    def _check_command_timeout(self):
+        """Disable motion if /vehicle_control stops arriving while motion is enabled."""
+        if (self._command_timeout <= 0 or self._timed_out or self._last_cmd_time is None
+                or self._outbound.veh_motion.value == 0):
+            return
+        age = time.monotonic() - self._last_cmd_time
+        if age < self._command_timeout:
+            return
+        self._timed_out = True
+        for name, value in (('veh_throttle', 0), ('veh_brake', self._timeout_brake),
+                            ('veh_motion', 0), ('veh_enable', 0)):
+            getattr(self._outbound, name).apply(str(value))
+        self.get_logger().warn(
+            f'No /vehicle_control for {age:.2f} s with motion enabled: throttle 0, '
+            f'brake {self._timeout_brake}, motion disabled')
 
     ### BRIDGE TO INTERNAL REP
     def _apply_inbound_data(self, d_fields: list[str]):
@@ -324,17 +408,24 @@ class SharedLinkNode(Node):
     ### SEND MSG + HELPERS
     def sendMsg(self, msg: str) -> None:
         msg = self._prep_for_send(msg)
-        ros_msg = String()
-        ros_msg.data = msg
-        self._outbound_pub.publish(ros_msg)
+        # UDP first: during shutdown the ROS publish can fail, and it must not stop the
+        # frame (e.g. the disconnect messages) from reaching Kairos.
         self._udp.send(msg)
+        if rclpy.ok():
+            ros_msg = String()
+            ros_msg.data = msg
+            try:
+                self._outbound_pub.publish(ros_msg)
+            except Exception:  # context already shutting down
+                pass
     
     def sendMsgs(self, msgs: list):
         for msg in msgs:
             self.sendMsg(msg)
 
     def get_checksum(self, s: str) -> str:
-        return f'{sum(ord(c) for c in s) % 0x100:X}'
+        # Two hex digits, zero-padded, as in the ICD's own frames (e.g. C07).
+        return f'{sum(ord(c) for c in s) % 0x100:02X}'
     
     def _prep_for_send(self, msg: str) -> str:
         msg = f":BA|{msg}|C"
@@ -357,6 +448,7 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        node.shutdown()   # end the Kairos session before the node goes away
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

@@ -1,7 +1,10 @@
-# Default and boosted scales. Can have different boosted scales if you want more fine controls.
+# Default and boosted scales. Boosted scales apply while the matching thumbstick is pressed
+# in, so the default can be set lower for finer control.
+# Ranges are from the SharedLink Teleop Only ICD. The teleop node clamps any scale above
+# them, and the bridge clamps every command it sends to them.
 scales:
   throttle_scale: 1000
-  throttle_scale_boosted: 1000    # 1000 is true max
-  steer_scale: 400.0
-  steer_scale_boosted: 400.0      # 450 is true max
-  brake_max: 100                  # 100 is max
+  throttle_scale_boosted: 1000    # 0-1000 = 0-100.0 % throttle; 1000 is the ICD max
+  steer_scale: 400.0              # steering-wheel degrees; the ICD max is 450
+  steer_scale_boosted: 400.0      # raise toward 450 only after confirming 400 doesn't reach full lock
+  brake_max: 100                  # 0-100 %; 100 is the ICD max

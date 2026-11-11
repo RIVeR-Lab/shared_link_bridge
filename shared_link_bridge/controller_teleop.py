@@ -88,11 +88,17 @@ _config_path = os.path.join(
 with open(_config_path) as _f:
     _scales = yaml.safe_load(_f)['scales']
 
-THROTTLE_SCALE = _scales['throttle_scale']
-THROTTLE_SCALE_BOOSTED = _scales['throttle_scale_boosted']
-STEER_SCALE = _scales['steer_scale']
-STEER_SCALE_BOOSTED = _scales['steer_scale_boosted']
-BRAKE_MAX = _scales['brake_max']
+# ICD maxima (SharedLink Teleop Only ICD). Scales above these are clamped here,
+# and the bridge clamps every outbound command to them as well.
+JOY_STEER_MAX = 450.0
+VEH_THROTTLE_MAX = 1000
+VEH_BRAKE_MAX = 100
+
+THROTTLE_SCALE = min(_scales['throttle_scale'], VEH_THROTTLE_MAX)
+THROTTLE_SCALE_BOOSTED = min(_scales['throttle_scale_boosted'], VEH_THROTTLE_MAX)
+STEER_SCALE = min(_scales['steer_scale'], JOY_STEER_MAX)
+STEER_SCALE_BOOSTED = min(_scales['steer_scale_boosted'], JOY_STEER_MAX)
+BRAKE_MAX = min(_scales['brake_max'], VEH_BRAKE_MAX)
 
 
 class ShiftPosition(Enum):
@@ -166,8 +172,16 @@ class ControllerNode(Node):
 
     def _joy_callback(self, msg: Joy):
         self._joy_rate.tick()
-        # Assert controller is sending expected information
-        assert len(msg.buttons) == len(BUTTON) and len(msg.axes) == len(AXIS)
+        # Wrong layout (e.g. F710 switched to D mode): warn and ignore the message instead
+        # of crashing. No /vehicle_control is published, so the bridge's watchdog disables
+        # motion if it was enabled.
+        if len(msg.buttons) != len(BUTTON) or len(msg.axes) != len(AXIS):
+            self.get_logger().warn(
+                f'Unexpected joystick layout: {len(msg.buttons)} buttons, {len(msg.axes)} axes '
+                f'(expected {len(BUTTON)} and {len(AXIS)}). Is the F710 switch on X? '
+                'Ignoring input.',
+                throttle_duration_sec=2.0)
+            return
 
         # Edge-triggered button actions
         for btn, action in BUTTONS.items():
@@ -199,7 +213,8 @@ class ControllerNode(Node):
         elif not deadman and was_deadman:
             self.stop()
 
-        # Continuous steering
+        # Continuous steering. ROS convention (REP 103): positive = left, matching the
+        # joystick (RX is +1 left). The bridge converts to Kairos's positive-right convention.
         steer_scale = STEER_SCALE_BOOSTED if self._held(msg, STEER_BOOST_BUTTON) else STEER_SCALE
         self._cmd.joy_steer = msg.axes[STEER_AXIS.value] * steer_scale
 
