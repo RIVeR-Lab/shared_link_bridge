@@ -135,10 +135,19 @@ class SharedLinkNode(Node):
         # Hard limits applied on the wire. Teleop's own scales live in controller_teleop.yaml.
         self.declare_parameter('steer_limit', JOY_STEER_MAX)        # float, <= 450.0
         self.declare_parameter('throttle_limit', VEH_THROTTLE_MAX)  # int, <= 1000
-        # Seconds without a /vehicle_control message, while motion is enabled, before the
-        # bridge disables motion on its own. 0.0 turns the watchdog off.
+        # Watchdog. If /vehicle_control stops for command_timeout seconds while motion is
+        # enabled, the bridge stops the vehicle in two stages, because Kairos freezes the
+        # actuators where they are when motion is disabled:
+        #   stage 1: throttle 0 and brake timeout_brake, motion still enabled, for
+        #            stop_hold_time seconds so the actuators actually move;
+        #   stage 2: motion disabled. The stop then latches until a command arrives with
+        #            veh_motion 0 (deadman released). 0.0 turns the watchdog off.
         self.declare_parameter('command_timeout', 0.5)
-        self.declare_parameter('timeout_brake', VEH_BRAKE_MAX)      # brake applied on timeout
+        self.declare_parameter('timeout_brake', VEH_BRAKE_MAX)      # int, 0-100
+        self.declare_parameter('stop_hold_time', 1.0)               # float, seconds
+        # Motion may only be enabled while veh_throttle is at or below this (0-1000), so a
+        # stored throttle command is never applied the moment motion comes on.
+        self.declare_parameter('enable_throttle_max', 50)
 
         self._update_rate = self.get_parameter('update_rate').value
         self._invert_steering = bool(self.get_parameter('invert_steering').value)
@@ -148,8 +157,12 @@ class SharedLinkNode(Node):
         self._command_timeout = float(self.get_parameter('command_timeout').value)
         self._timeout_brake = max(0, min(int(self.get_parameter('timeout_brake').value),
                                          VEH_BRAKE_MAX))
+        self._stop_hold_time = max(0.0, float(self.get_parameter('stop_hold_time').value))
+        self._enable_throttle_max = max(0, min(int(self.get_parameter('enable_throttle_max').value),
+                                               VEH_THROTTLE_MAX))
         self._last_cmd_time = None   # monotonic time of the last /vehicle_control message
-        self._timed_out = False
+        self._stop_state = 'run'     # 'run' | 'stopping' (stage 1) | 'stopped' (latched)
+        self._stop_started = None
         self._disconnected = False
         self._closed = False
         self._outbound = SharedLinkOutbound()
@@ -183,6 +196,11 @@ class SharedLinkNode(Node):
 
         self._connect()
 
+        self.get_logger().info(
+            f"Safety: command_timeout {self._command_timeout:.2f} s, stop_hold_time "
+            f"{self._stop_hold_time:.2f} s, timeout_brake {self._timeout_brake}, "
+            f"enable_throttle_max {self._enable_throttle_max}, "
+            f"invert_steering {self._invert_steering}")
         self.get_logger().info("shared_link_bridge_node successfully initialized")
 
     def shutdown(self):
@@ -225,12 +243,30 @@ class SharedLinkNode(Node):
     ### SUBSCRIBERS
     def _vehicle_control_callback(self, msg: VehicleControl):
         self._last_cmd_time = time.monotonic()
-        if self._timed_out:
-            self._timed_out = False
-            self.get_logger().info('/vehicle_control resumed')
+        if self._stop_state == 'stopping':
+            return  # let the stop finish; commands are ignored until it latches
+        if self._stop_state == 'stopped':
+            if msg.veh_motion != 0:
+                self.get_logger().warn(
+                    'Watchdog stop is latched: release the deadman (veh_motion 0) to re-arm',
+                    throttle_duration_sec=2.0)
+                return
+            self._stop_state = 'run'
+            self.get_logger().info('Watchdog stop cleared by veh_motion 0')
+
+        enabling = self._outbound.veh_motion.value == 0 and msg.veh_motion != 0
         for f in fields(self._outbound):
             sv: SVField = getattr(self._outbound, f.name)
             sv.apply(str(getattr(msg, f.name)))
+
+        # Enable interlock: Kairos applies whatever is stored the moment motion comes on.
+        if enabling and int(msg.veh_throttle) > self._enable_throttle_max:
+            for name in ('veh_motion', 'veh_enable', 'veh_throttle'):
+                getattr(self._outbound, name).apply('0')
+            self.get_logger().warn(
+                f'Motion enable refused: veh_throttle {int(msg.veh_throttle)} > '
+                f'{self._enable_throttle_max}. Release the throttle first.',
+                throttle_duration_sec=2.0)
         # self.send_data()
         
     ### SERVICES
@@ -261,6 +297,11 @@ class SharedLinkNode(Node):
     def _field_update_callback(self, request: FieldUpdate.Request, response: FieldUpdate.Response):
         sv = self.get_outbound_field(request.name)
         if sv is None:
+            response.success = False
+            return response
+        if self._stop_state != 'run' and request.name in (
+                'veh_motion', 'veh_enable', 'veh_throttle', 'veh_brake'):
+            self.get_logger().warn(f'field_update of {request.name} refused during a watchdog stop')
             response.success = False
             return response
         sv.apply(request.value)
@@ -382,20 +423,30 @@ class SharedLinkNode(Node):
         return value
 
     def _check_command_timeout(self):
-        """Disable motion if /vehicle_control stops arriving while motion is enabled."""
-        if (self._command_timeout <= 0 or self._timed_out or self._last_cmd_time is None
-                or self._outbound.veh_motion.value == 0):
+        """Two-stage stop if /vehicle_control stops arriving while motion is enabled."""
+        now = time.monotonic()
+        if self._stop_state == 'stopping':
+            if now - self._stop_started >= self._stop_hold_time:
+                for name in ('veh_motion', 'veh_enable'):
+                    getattr(self._outbound, name).apply('0')
+                self._stop_state = 'stopped'
+                self.get_logger().warn(
+                    'Watchdog stop stage 2: motion disabled. Latched until veh_motion 0.')
             return
-        age = time.monotonic() - self._last_cmd_time
+        if (self._stop_state == 'stopped' or self._command_timeout <= 0
+                or self._last_cmd_time is None or self._outbound.veh_motion.value == 0):
+            return
+        age = now - self._last_cmd_time
         if age < self._command_timeout:
             return
-        self._timed_out = True
-        for name, value in (('veh_throttle', 0), ('veh_brake', self._timeout_brake),
-                            ('veh_motion', 0), ('veh_enable', 0)):
+        # Stage 1: release the throttle and brake while Kairos is still acting on commands.
+        for name, value in (('veh_throttle', 0), ('veh_brake', self._timeout_brake)):
             getattr(self._outbound, name).apply(str(value))
+        self._stop_state = 'stopping'
+        self._stop_started = now
         self.get_logger().warn(
-            f'No /vehicle_control for {age:.2f} s with motion enabled: throttle 0, '
-            f'brake {self._timeout_brake}, motion disabled')
+            f'No /vehicle_control for {age:.2f} s with motion enabled. Watchdog stop stage 1: '
+            f'throttle 0, brake {self._timeout_brake}, holding {self._stop_hold_time:.2f} s')
 
     ### BRIDGE TO INTERNAL REP
     def _apply_inbound_data(self, d_fields: list[str]):
