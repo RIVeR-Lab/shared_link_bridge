@@ -144,7 +144,7 @@ class SharedLinkNode(Node):
         #            veh_motion 0 (deadman released). 0.0 turns the watchdog off.
         self.declare_parameter('command_timeout', 0.5)
         self.declare_parameter('timeout_brake', VEH_BRAKE_MAX)      # int, 0-100
-        self.declare_parameter('stop_hold_time', 1.0)               # float, seconds
+        self.declare_parameter('stop_hold_time', 5.0)               # float, seconds
         # Motion may only be enabled while veh_throttle is at or below this (0-1000), so a
         # stored throttle command is never applied the moment motion comes on.
         self.declare_parameter('enable_throttle_max', 50)
