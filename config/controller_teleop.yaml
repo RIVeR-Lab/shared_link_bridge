@@ -6,14 +6,22 @@ scales:
   throttle_scale: 1000
   throttle_scale_boosted: 1000    # 0-1000 = 0-100.0 % throttle; 1000 is the ICD max
   steer_scale: 400.0              # steering-wheel degrees; the ICD max is 450
-  steer_scale_boosted: 400.0      # raise toward 450 only after confirming 400 doesn't reach full lock
+  steer_scale_boosted: 425.0      # raise toward 450 only after confirming 400 doesn't reach full lock
   brake_max: 100                  # 0-100 %; 100 is the ICD max
 
 # Two-stage stop and enable interlock. Kairos freezes the actuators where they are when
 # motion is disabled, so a stop first releases the throttle and brakes with motion still
 # enabled, then disables motion. Set stop_hold_time from the measured actuator times.
 safety:
-  stop_hold_time: 5.0             # s of throttle 0 + brake before motion is disabled
+  stop_hold_time: 3.0             # s of throttle 0 + brake before motion is disabled
   release_brake: 100              # brake applied while stopping, 0-100
   enable_throttle_max: 0.05       # stick fraction; motion only enables at or below this
   joy_timeout: 0.5                # s without valid /joy while enabled before teleop stops
+
+# Throttle latch, for holding an exact level during throttle tests. With the deadman held,
+# LB freezes the current throttle and X / Y step it down / up. LB again, pulling the stick
+# into brake, or any stop releases it.
+latch:
+  step: 10                        # veh_throttle units per X / Y press
+  max: 400                        # the latch never goes above this, even with Y
+  release_on_brake: 0.10          # stick fraction pulled down that releases the latch

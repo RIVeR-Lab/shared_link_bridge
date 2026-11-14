@@ -77,6 +77,14 @@ DEADMAN_BUTTON = BUTTON.RB         # held -> motion enabled
 THROTTLE_BOOST_BUTTON = BUTTON.LJ  # held -> boosted throttle scale
 STEER_BOOST_BUTTON = BUTTON.RJ     # held -> boosted steering scale
 
+# Throttle latch, for holding an exact level during throttle tests. While motion is enabled,
+# LB freezes the current throttle; X / Y step the latched level down / up by latch.step.
+# The latch releases on LB again, on pulling the stick into brake, and on any stop
+# (deadman release, joystick loss) or loss of motion.
+LATCH_BUTTON = BUTTON.LB
+LATCH_DOWN_BUTTON = BUTTON.X
+LATCH_UP_BUTTON = BUTTON.Y
+
 # Continuous control axes.
 THROTTLE_AXIS = AXIS.LY   # positive forward, negative brake
 STEER_AXIS = AXIS.RX
@@ -109,6 +117,12 @@ STOP_HOLD_TIME = max(0.0, float(_safety.get('stop_hold_time', 1.0)))
 RELEASE_BRAKE = max(0, min(int(_safety.get('release_brake', VEH_BRAKE_MAX)), VEH_BRAKE_MAX))
 ENABLE_THROTTLE_MAX = float(_safety.get('enable_throttle_max', 0.05))  # stick fraction
 JOY_TIMEOUT = float(_safety.get('joy_timeout', 0.5))
+
+# Throttle latch (latch: section of controller_teleop.yaml).
+_latch = _config.get('latch') or {}
+LATCH_STEP = max(1, int(_latch.get('step', 10)))
+LATCH_MAX = max(0, min(int(_latch.get('max', THROTTLE_SCALE_BOOSTED)), VEH_THROTTLE_MAX))
+LATCH_RELEASE_BRAKE = abs(float(_latch.get('release_on_brake', 0.10)))  # stick fraction pulled down
 SAFETY_TICK = 0.05  # s
 
 
@@ -141,6 +155,7 @@ class ControllerNode(Node):
         self._deadman_armed = False    # deadman must be seen released once after startup
         self._enable_pending = False   # deadman pressed with throttle up; enables at zero
         self._last_joy_time = None     # monotonic time of the last valid /joy message
+        self._latched = None           # latched throttle level, or None
 
         self._get_ctrl_client = self.create_client(GetVehicleControl, 'get_vehicle_control')
         self._exec_cmd_client = self.create_client(ExecCmd, 'exec_cmd')
@@ -266,10 +281,31 @@ class ControllerNode(Node):
 
             # Throttle / brake. Throttle is only ever nonzero while motion is enabled, so
             # no throttle command is stored while disabled.
-            if v >= 0:
-                throttle_scale = THROTTLE_SCALE_BOOSTED if self._held(msg, THROTTLE_BOOST_BUTTON) else THROTTLE_SCALE
-                enabled = self._motion_state is MotionState.ENABLED
-                self._cmd.veh_throttle = int(v * throttle_scale) if enabled else 0
+            enabled = self._motion_state is MotionState.ENABLED
+            throttle_scale = THROTTLE_SCALE_BOOSTED if self._held(msg, THROTTLE_BOOST_BUTTON) else THROTTLE_SCALE
+            stick_throttle = int(v * throttle_scale) if (enabled and v >= 0) else 0
+
+            # Throttle latch: released by braking or by losing motion, toggled by LB,
+            # stepped by X / Y. Never active while motion is disabled.
+            if self._latched is not None and (not enabled or v < -LATCH_RELEASE_BRAKE):
+                self._release_latch('brake applied' if enabled else 'motion not enabled')
+            if enabled and self._pressed(msg, LATCH_BUTTON):
+                if self._latched is not None:
+                    self._release_latch('LB pressed')
+                elif stick_throttle > 0:
+                    self._latched = min(stick_throttle, LATCH_MAX)
+                    self.get_logger().info(f'Throttle latched at {self._latched}')
+            if self._latched is not None:
+                if self._pressed(msg, LATCH_UP_BUTTON):
+                    self._latched = min(self._latched + LATCH_STEP, LATCH_MAX)
+                    self.get_logger().info(f'Throttle latch raised to {self._latched}')
+                if self._pressed(msg, LATCH_DOWN_BUTTON):
+                    self._latched = max(self._latched - LATCH_STEP, 0)
+                    self.get_logger().info(f'Throttle latch lowered to {self._latched}')
+                self._cmd.veh_throttle = self._latched
+                self._cmd.veh_brake = 0
+            elif v >= 0:
+                self._cmd.veh_throttle = stick_throttle
                 self._cmd.veh_brake = 0
             else:
                 self._cmd.veh_throttle = 0
@@ -284,6 +320,15 @@ class ControllerNode(Node):
 
     def _was_held(self, btn: BUTTON) -> bool:
         return btn.value < len(self._prev_buttons) and self._prev_buttons[btn.value] == 1
+
+    def _pressed(self, msg: Joy, btn: BUTTON) -> bool:
+        """Edge-trigger: true on the message where `btn` goes from released to held."""
+        return self._held(msg, btn) and not self._was_held(btn)
+
+    def _release_latch(self, reason: str):
+        if self._latched is not None:
+            self.get_logger().info(f'Throttle latch released ({reason})')
+        self._latched = None
 
     def _axis_edge(self, msg: Joy, axis: AXIS, value: float) -> bool:
         """Edge-trigger: true when `axis` just transitioned to `value`."""
@@ -302,11 +347,13 @@ class ControllerNode(Node):
         # The veh_motion is supposed to be the deadman's switch
         self._motion_state = MotionState.ENABLED
         self._enable_pending = False
+        self._latched = None
         self._cmd.veh_motion = 1
         self._cmd.veh_enable = 1
 
     def begin_stop(self, reason: str):
         """Stage 1: throttle 0 and brake, with motion still enabled so Kairos acts on them."""
+        self._release_latch(reason)
         self._motion_state = MotionState.STOPPING
         self._stop_started = time.monotonic()
         self._cmd.veh_throttle = 0
@@ -317,6 +364,7 @@ class ControllerNode(Node):
     def finish_stop(self):
         """Stage 2: disable motion once the actuators have had time to move."""
         self._motion_state = MotionState.DISABLED
+        self._latched = None
         self._cmd.veh_motion = 0
         self._cmd.veh_enable = 0
         self._cmd.veh_throttle = 0
@@ -396,9 +444,15 @@ class ControllerNode(Node):
             hint = "  (release deadman, then press to enable)"
         else:
             hint = ""
+        if self._latched is not None:
+            latch = f"  LATCHED (X/Y -/+{LATCH_STEP}, LB or brake releases)"
+        elif self._motion_state is MotionState.ENABLED:
+            latch = "  (LB latches)"
+        else:
+            latch = ""
         return [
             f"motion:   {state}{hint}",
-            f"throttle: {self._cmd.veh_throttle}",
+            f"throttle: {self._cmd.veh_throttle}{latch}",
             f"brake:    {self._cmd.veh_brake}",
             f"steer:    {self._cmd.joy_steer:+.1f}",
             "",

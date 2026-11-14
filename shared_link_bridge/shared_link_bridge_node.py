@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import re
 import time
 from typing import Union
 
@@ -21,6 +22,11 @@ JOY_STEER_MAX = 450.0    # steering-wheel degrees, +-450
 VEH_BRAKE_MAX = 100      # 0-100 %
 VEH_THROTTLE_MAX = 1000  # 0-1000 = 0-100.0 %
 VEH_SHIFT_MAX = 3        # 0 Park, 1 Reverse, 2 Neutral, 3 Drive
+
+# Read-only probing of Kairos shared variables over /sharedlink_query (see _query_callback).
+QUERY_NAME_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+LIST_REQUESTS = ('N?', 'L?', 'A?')   # Kairos's outbound list, inbound list, all variables
+MAX_QUERIES_PER_MSG = 10
 
 
 class TYPE(Enum):
@@ -144,7 +150,7 @@ class SharedLinkNode(Node):
         #            veh_motion 0 (deadman released). 0.0 turns the watchdog off.
         self.declare_parameter('command_timeout', 0.5)
         self.declare_parameter('timeout_brake', VEH_BRAKE_MAX)      # int, 0-100
-        self.declare_parameter('stop_hold_time', 5.0)               # float, seconds
+        self.declare_parameter('stop_hold_time', 3.0)               # float, seconds
         # Motion may only be enabled while veh_throttle is at or below this (0-1000), so a
         # stored throttle command is never applied the moment motion comes on.
         self.declare_parameter('enable_throttle_max', 50)
@@ -190,6 +196,12 @@ class SharedLinkNode(Node):
         self._field_update_srv = self.create_service(
             FieldUpdate, 'field_update',
             self._field_update_callback)
+
+        # Read-only SharedLink queries in, raw replies out (see _query_callback).
+        self._responses_pub = self.create_publisher(String, 'sharedlink_responses', 10)
+        self._query_sub = self.create_subscription(
+            String, 'sharedlink_query',
+            self._query_callback, 10)
 
         self._update_timer = self.create_timer(self._update_rate, self._timer_callback)
         self._inbound_count = 0
@@ -311,6 +323,30 @@ class SharedLinkNode(Node):
         response.success = True        
         return response
 
+    def _query_callback(self, msg: String):
+        """Send read-only SharedLink queries to Kairos.
+
+        msg.data is a comma-separated list of shared-variable names, each sent as a
+        named query with no data field ([:BA|Q<name>|Cxx]), or one of N?, L?, A?.
+        Nothing else is accepted, so this topic can't write a variable or send a pipe
+        command. Replies are published raw on sharedlink_responses.
+        """
+        items = [s.strip() for s in msg.data.split(',') if s.strip()]
+        if not items or len(items) > MAX_QUERIES_PER_MSG:
+            self.get_logger().warn(
+                f'Query refused: send 1-{MAX_QUERIES_PER_MSG} comma-separated names, '
+                f'or one of {", ".join(LIST_REQUESTS)}')
+            return
+        for item in items:
+            if item in LIST_REQUESTS:
+                self.sendMsg(item)
+            elif QUERY_NAME_RE.fullmatch(item):
+                self.sendMsg(f'Q{item}')
+            else:
+                self.get_logger().warn(
+                    f'Query refused: {item!r} is not a variable name or one of '
+                    f'{", ".join(LIST_REQUESTS)}')
+
     ### TIMER
     def _timer_callback(self):
         self._check_command_timeout()
@@ -343,22 +379,17 @@ class SharedLinkNode(Node):
             # assert calcCheckSum(data[1:-3]) == data[-3:-1]
 
             match split_data[1]:
-                case "N0":
-                    match split_data[2][0]:
-                        case "D":
-                            self._apply_inbound_data(split_data[2:-1])
-                        case "R":
-                            print("Received R type:")
-                            print(data)
-                        case _:
-                            print(f"Received N0 then {split_data[2]}")
-                            print(data)
+                case "N0" if len(split_data) > 2 and split_data[2].startswith("D"):
+                    self._apply_inbound_data(split_data[2:-1])
                 case "P0":
                     self.sendMsg(pong_msg)
                 case "G0":
                     print("Received Pong Message (ping ACK)")
                 case _:
-                    print(f"Received {split_data[1]} msg: {data}")
+                    # Anything else is a reply to a query or list request (R, N0|R..., L0, A0)
+                    # or something unexpected. Named replies (R...) arrive at the polling rate,
+                    # so they are published but not printed.
+                    self._publish_response(data, echo=not split_data[1].startswith("R"))
 
     ### SEND
 
@@ -455,6 +486,17 @@ class SharedLinkNode(Node):
             sv.apply(d_fields[i][1:])  # strip leading 'D'
         self._publish_kairos_values()
         self._publish_gps_values()
+
+    def _publish_response(self, frame: str, echo: bool = True):
+        if rclpy.ok():
+            ros_msg = String()
+            ros_msg.data = frame
+            try:
+                self._responses_pub.publish(ros_msg)
+            except Exception:  # context shutting down
+                pass
+        if echo:
+            print(f"Received: {frame}")
 
     ### SEND MSG + HELPERS
     def sendMsg(self, msg: str) -> None:

@@ -39,8 +39,11 @@ list_SVs_msgs = [
     "MUI",
     "MUO",
     "N0|T0|Qvideo_mux1|T0|Qveh_start|T0|Qveh_enable|T0|Qveh_motion|T2|Qjoy_steer|T0|Qveh_steer|T0|Qveh_brake|T0|Qveh_throttle|T0|Qveh_shift|T0|Qveh_clutch",
-    "L0|T2|QAutoGpsHead|T2|QAutoGpsLat|T2|QAutoGpsLon|T2|QAutoGpsVel|T0|QAutoGpsReferences|T0|QAutoGpsQuality|T2|QAutoGpsStamp|T0|Qpause|T0|Qkey_on|T0|Qeng_enb|T0|Qpe7|T0|Qbbrake|T0|Qfbrake|T2|Qsteerang|T0|Qthrottle|Qsvp_enb_eng|T0|Qserialpck|T0|Qveh_gear|T0|Qveh_state|T0|Qveh_estop|T0|Qveh_obstacle|T2|Qvehicle_bat|T4|Qrun_composite|T4|QVehicleName|T0|QHealth_total|T0|Qrpm|T0|Qfuel|T2|Qsys_thd"
-    "MW",
+    "L0|T2|QAutoGpsHead|T2|QAutoGpsLat|T2|QAutoGpsLon|T2|QAutoGpsVel|T0|QAutoGpsReferences|T0|QAutoGpsQuality|T2|QAutoGpsStamp|T0|Qpause|T0|Qkey_on|T0|Qeng_enb|T0|Qpe7|T0|Qbbrake|T0|Qfbrake|T2|Qsteerang|T0|Qthrottle|Qsvp_enb_eng|T0|Qserialpck|T0|Qveh_gear|T0|Qveh_state|T0|Qveh_estop|T0|Qveh_obstacle|T2|Qvehicle_bat|T4|Qrun_composite|T4|QVehicleName|T0|QHealth_total|T0|Qrpm|T0|Qfuel|T2|Qsys_thd",
+    # "MW" (write the lists to the P4S4's INI file) is deliberately not sent. The bridge sets
+    # both lists on every connect, so there is nothing to persist, and saved lists could
+    # change what Shepherd sees. A missing comma used to glue "MW" onto the L0 string above,
+    # so MW was never sent and the last variable was requested as "sys_thdMW".
     "ML"
 ]
 # ^^^^^
