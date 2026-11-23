@@ -6,7 +6,7 @@ scales:
   throttle_scale: 1000
   throttle_scale_boosted: 1000    # 0-1000 = 0-100.0 % throttle; 1000 is the ICD max
   steer_scale: 400.0              # steering-wheel degrees; the ICD max is 450
-  steer_scale_boosted: 425.0      # raise toward 450 only after confirming 400 doesn't reach full lock
+  steer_scale_boosted: 400.0      # raise toward 450 only after confirming 400 doesn't reach full lock
   brake_max: 100                  # 0-100 %; 100 is the ICD max
 
 # Two-stage stop and enable interlock. Kairos freezes the actuators where they are when
@@ -25,3 +25,12 @@ latch:
   step: 10                        # veh_throttle units per X / Y press
   max: 400                        # the latch never goes above this, even with Y
   release_on_brake: 0.10          # stick fraction pulled down that releases the latch
+
+# Brake preset, for repeatable brake tests. With the deadman held, B applies the brake at this
+# value and B again releases it. The stick still brakes, and can always brake harder (the larger
+# of the two is sent). Pushing the stick into throttle, or any stop, also releases it.
+# For one run, override without editing this file:
+#   ros2 run shared_link_bridge controller_teleop.py --ros-args -p brake_preset:=65
+brake_preset:
+  value: 50                       # veh_brake, 0-100
+  release_on_throttle: 0.10       # stick fraction pushed up that releases the preset
