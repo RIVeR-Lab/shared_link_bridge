@@ -21,6 +21,10 @@ def generate_launch_description():
             executable='joy_node',
             name='joy_node',
             output='screen',
+            parameters=[{
+                'autorepeat_rate': 20.0,
+            }],
+
         ),
         Node(
             package='shared_link_bridge',
